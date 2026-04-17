@@ -1,0 +1,28 @@
+{
+  "models": {
+    "code-qwen-80B": {
+      "label": "Qwen3-Coder-Next",
+      "launcher": "~/.local/bin/llama-serve-qwen3-coder-next",
+      "thresholds": { "high": 12.0, "medium": 6.0 }
+    },
+    "qwen-32B": {
+      "label": "Qwen3-32B",
+      "launcher": "~/.local/bin/llama-serve-qwen3-32b",
+      "thresholds": { "high": 10.0, "medium": 5.0 }
+    },
+    "llama-70B": {
+      "label": "DeepSeek-R1-Distill-Llama-70B",
+      "launcher": "~/.local/bin/llama-serve-deepseek-r1-70b",
+      "thresholds": { "high": 12.0, "medium": 6.0 }
+    }
+  },
+  "settings": {
+    "idle_unload_timeout_minutes": 15,
+    "request_queue_timeout_seconds": 60,
+    "public_host": "100.72.248.102",
+    "public_port": 18080,
+    "admin_host": "127.0.0.1",
+    "admin_port": 18079,
+    "backend_base": "http://127.0.0.1:18081"
+  }
+}

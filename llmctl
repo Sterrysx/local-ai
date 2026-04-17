@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import threading
+from datetime import datetime
+
+# Path Configuration
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local/share/llama-services")
+CONFIG_PATH = os.path.join(HOME, ".config/locai/config.json")
+ESTIMATES_PATH = os.path.join(HOME, ".config/locai/estimates.json")
+HISTORY_DIR = os.path.join(STATE_DIR, "history")
+import secrets
+API_KEY = os.getenv("LOCAI_API_KEY")
+if not API_KEY:
+    API_KEY = secrets.token_hex(16)
+    print(f"WARNING: LOCAI_API_KEY not set. Generated random key: {API_KEY}")
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.spinner import Spinner
+    from rich.live import Live
+    from rich.markdown import Markdown
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+    HAVE_RICH = True
+except: HAVE_RICH = False
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.styles import Style
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+    HAVE_PROMPT = True
+except: HAVE_PROMPT = False
+
+c = Console() if HAVE_RICH else None
+
+def load_estimates():
+    try:
+        if os.path.exists(ESTIMATES_PATH):
+            with open(ESTIMATES_PATH, "r") as f: return json.load(f)
+    except: pass
+    return {"code-qwen-80B": 25, "qwen-32B": 20, "llama-70B": 45, "default": 30}
+
+def save_estimates(data):
+    try:
+        os.makedirs(os.path.dirname(ESTIMATES_PATH), exist_ok=True)
+        with open(ESTIMATES_PATH, "w") as f: json.dump(data, f)
+    except: pass
+
+def load_config():
+    with open(CONFIG_PATH, "r") as f: return json.load(f)
+
+def get_status():
+    try:
+        cfg = load_config()
+        url = f"http://{cfg['settings']['admin_host']}:{cfg['settings']['admin_port']}/internal/status"
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {API_KEY}")
+        with urllib.request.urlopen(req, timeout=2) as r: return json.loads(r.read())
+    except: return {}
+
+class LocaiCompleter(Completer):
+    def __init__(self):
+        self.commands = ["/use", "/models", "/clear", "/compact", "/undo", "/retry", "/save", "/resume", "/status", "/vram", "/help", "/exit"]
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if text.startswith("/use "):
+            sub = text[5:]
+            for m in get_status().get("available_models", []):
+                if m.startswith(sub): yield Completion(m, start_position=-len(sub))
+        elif text.startswith("/resume "):
+            sub = text[8:]
+            if os.path.exists(HISTORY_DIR):
+                for h in [f.replace(".json", "") for f in os.listdir(HISTORY_DIR) if f.endswith(".json")]:
+                    if h.startswith(sub): yield Completion(h, start_position=-len(sub))
+        elif text.startswith("/"):
+            for cmd in self.commands:
+                if cmd.startswith(text): yield Completion(cmd, start_position=-len(text))
+
+def print_banner():
+    shark = r"""
+[bold cyan]
+             .
+            / \
+           /   \
+          /     \
+    _____/       \_____
+   |  _  \       /  _  |
+   | | \  \     /  / | |
+   | |  \  \___/  /  | |
+   | |   \_______/   | |
+   | |      / \      | |
+   | |     /   \     | |
+   |_|    /     \    |_|
+
+      .            _  _
+    _/ \_      _  ( \/ )
+   /     \    / \  \  /
+  /   _   \  /   \  \/
+ /   / \   \/     \
+/   /   \   \      \
+\__/     \__/       \
+[/bold cyan]
+[bold white]   _        _______  _______  _______  _________ [/bold white]
+[bold white]  ( \      (  ___  )(  ____ \(  ___  )\__   __/ [/bold white]
+[bold white]  | (      | (   ) || (    \/| (   ) |   ) (    [/bold white]
+[bold white]  | |      | |   | || |      | (___) |   | |    [/bold white]
+[bold white]  | |      | |   | || |      |  ___  |   | |    [/bold white]
+[bold white]  | |      | |   | || |      | (   ) |   | |    [/bold white]
+[bold white]  | (____/\| (___) || (____/\| )   ( |___) (___ [/bold white]
+[bold white]  (_______/(_______)(_______/|/     \|\_______/ [/bold white]
+[dim]   Local-AI Orchestrator v3.5 | {time}[/dim]
+""".format(time=datetime.now().strftime('%H:%M'))
+    if HAVE_RICH: c.print(shark)
+    else: print("Locai Orchestrator Active")
+
+_gpu_stats_cache = {"time": 0, "data": []}
+def get_gpu_stats():
+    global _gpu_stats_cache
+    if time.time() - _gpu_stats_cache["time"] < 1.0: return _gpu_stats_cache["data"]
+    try:
+        res = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"], capture_output=True, text=True)
+        _gpu_stats_cache["data"] = [{"idx": l.split(",")[0], "used": int(l.split(",")[1])/1024, "total": int(l.split(",")[2])/1024} for l in res.stdout.strip().splitlines()]
+        _gpu_stats_cache["time"] = time.time()
+        return _gpu_stats_cache["data"]
+    except: return []
+
+def get_status_line():
+    status = get_status()
+    active = status.get("active_model") or "none"
+    pending = status.get("pending_model")
+    vram = status.get("backend_vram_mib", 0) / 1024
+    
+    profiles = status.get("profiles", {})
+    active_profile = profiles.get(active, {})
+    ctx_size = active_profile.get("ctx_size", "N/A")
+    
+    if pending:
+        model_info = f"[bold cyan]{active}[/bold cyan] [dim]→[/dim] [bold yellow]{pending}[/bold yellow]"
+    elif active == "none":
+        model_info = "No model active. Type /models"
+    else:
+        model_info = f"[bold cyan]{active}[/bold cyan] [dim]({vram:.1f} GB) | Ctx: {ctx_size}[/dim]"
+    
+    gpus = get_gpu_stats()
+    gpu_parts = []
+    for g in gpus:
+        pct = (g['used'] / g['total']) * 100
+        color = "green" if pct < 50 else ("yellow" if pct < 85 else "red")
+        gpu_parts.append(f"GPU{g['idx']}: [{color}]{pct:.0f}%[/] [dim]({g['used']:.1f}/{g['total']:.0f} GB)[/]")
+    
+    if active == "none":
+        return f" {model_info} | {' | '.join(gpu_parts)}"
+    return f" [bold]Model:[/bold] {model_info} | {' | '.join(gpu_parts)}"
+
+def chat_request_stream(model, messages):
+    try:
+        cfg = load_config()
+        url = f"http://{cfg['settings']['public_host']}:{cfg['settings']['public_port']}/v1/chat/completions"
+        payload = {"model": model, "messages": messages, "stream": True}
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {API_KEY}")
+        
+        full_reply, tokens, start_t = "", 0, time.time()
+        ttft = None
+        
+        if HAVE_RICH:
+            c.print("\n[bold blue]Assistant[/bold blue]")
+            status_spinner = c.status("Evaluating prompt...")
+            status_spinner.start()
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    for line in resp:
+                        line = line.decode().strip()
+                        if line.startswith("data: "):
+                            if status_spinner:
+                                status_spinner.stop()
+                                status_spinner = None
+                            if line == "data: [DONE]": break
+                            try:
+                                delta = json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+                                if delta:
+                                    if ttft is None: ttft = time.time() - start_t
+                                    full_reply += delta
+                                    tokens += 1
+                                    print(delta, end="", flush=True)
+                            except: pass
+            finally:
+                if status_spinner: status_spinner.stop()
+            print("\n")
+            
+            ttlt = time.time() - start_t
+            ttft_str = f"{ttft:.2f}s" if ttft else "N/A"
+            tps = (tokens / ttlt) if ttlt > 0 else 0
+            
+            # Print a nice summary footer instead of wrapping the whole huge text in a Panel
+            c.print(f"[dim blue]└─ Speed: {tps:.1f} t/s | TTFT: {ttft_str} | TTLT: {ttlt:.2f}s[/dim blue]\n")
+        else:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                for line in resp:
+                    line = line.decode().strip()
+                    if line.startswith("data: "):
+                        if line == "data: [DONE]": break
+                        try:
+                            delta = json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                if ttft is None: ttft = time.time() - start_t
+                                full_reply += delta
+                                print(delta, end="", flush=True)
+                        except: pass
+            print("\n")
+            ttlt = time.time() - start_t
+            ttft_str = f"{ttft:.2f}s" if ttft else "N/A"
+            tps = (tokens / ttlt) if ttlt > 0 else 0
+            print(f"[Speed: {tps:.1f} t/s | TTFT: {ttft_str} | TTLT: {ttlt:.2f}s]")
+        return full_reply
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode()
+        try: err_msg = json.loads(err_msg).get("error", {}).get("message", err_msg)
+        except: pass
+        if HAVE_RICH: c.print(Panel(f"{err_msg}", title=f"System Error {e.code}", border_style="red"))
+        else: print(f"Error {e.code}: {err_msg}")
+        return ""
+    except Exception as e:
+        if HAVE_RICH: c.print(f"[red]Error:[/red] {e}")
+        else: print(f"Error: {e}")
+        return ""
+
+def ensure_model(model):
+    estimates = load_estimates()
+    est = estimates.get(model, estimates["default"])
+    try:
+        cfg = load_config()
+        url = f"http://{cfg['settings']['admin_host']}:{cfg['settings']['admin_port']}/internal/load"
+        start_t = time.time()
+        
+        if HAVE_RICH:
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"), TimeElapsedColumn(), transient=True) as progress:
+                progress.add_task(f"Loading {model} (est. {est}s)...", total=None)
+                req = urllib.request.Request(url, data=json.dumps({"model": model}).encode(), method="POST")
+                req.add_header("Authorization", f"Bearer {API_KEY}")
+                with urllib.request.urlopen(req, timeout=240) as r:
+                    if r.status == 200:
+                        actual = int(time.time() - start_t)
+                        estimates[model] = actual
+                        save_estimates(estimates)
+                        c.print(f"[green]Loaded in {actual}s[/green]")
+                        return True
+        else:
+            print(f"Loading {model}...")
+            req = urllib.request.Request(url, data=json.dumps({"model": model}).encode(), method="POST")
+            req.add_header("Authorization", f"Bearer {API_KEY}")
+            with urllib.request.urlopen(req, timeout=240) as r:
+                if r.status == 200: return True
+    except Exception as e:
+        if HAVE_RICH: c.print(f"[red]Load failed:[/red] {e}")
+        else: print(f"Load failed: {e}")
+    return False
+
+def show_vram():
+    status = get_status()
+    gpus = get_gpu_stats()
+    active_model = status.get("active_model", "none")
+    model_vram_mib = status.get("backend_vram_mib", 0)
+    
+    for g in gpus:
+        total = g['total']
+        used = g['used']
+        pct = (used/total)*100
+        
+        total_model_vram = (model_vram_mib / 1024) / len(gpus) if active_model != "none" else 0
+        
+        weight_gb = 0
+        if active_model != "none":
+            prof = status.get("profiles", {}).get(active_model, {})
+            if "vram_weight_gb" in prof:
+                weight_gb = prof["vram_weight_gb"] / len(gpus)
+            if weight_gb == 0: weight_gb = total_model_vram * 0.75
+            
+        weight_gb = min(weight_gb, total_model_vram)
+        ctx_vram = total_model_vram - weight_gb
+        
+        # If the total VRAM is very tight and context drops to 0, artificially carve out 
+        # a realistic context window from the weight bucket for visualization purposes.
+        if ctx_vram < 0.1 and total_model_vram > 0:
+             ctx_vram = min(1.0, total_model_vram * 0.05)
+             weight_gb = total_model_vram - ctx_vram
+
+        other_vram = max(0, used - total_model_vram)
+        free_vram = total - used
+        
+        if HAVE_RICH:
+            width = 50
+            w_chars = int((weight_gb / total) * width)
+            c_chars = int((ctx_vram / total) * width)
+            o_chars = int((other_vram / total) * width)
+            f_chars = width - w_chars - c_chars - o_chars
+            
+            bar = f"[blue]{'█'*w_chars}[/][magenta]{'█'*c_chars}[/][yellow]{'█'*o_chars}[/][dim white]{'░'*f_chars}[/]"
+            c.print(f"[bold]GPU {g['idx']}[/bold] | {bar} [dim]{used:.1f}/{total:.1f} GB ({pct:.0f}%)[/dim]")
+            c.print(f"  [blue]■[/blue] {active_model}: {weight_gb:.1f} GB  [magenta]■[/magenta] Context: {ctx_vram:.1f} GB  [yellow]■[/yellow] System: {other_vram:.1f} GB  [dim]■ Free: {free_vram:.1f} GB[/dim]\n")
+        else:
+            print(f"GPU {g['idx']}: {used:.1f}/{total:.1f} GB ({pct:.0f}%)")
+
+def save_history(messages, name=None):
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    if not name:
+        name = f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    path = os.path.join(HISTORY_DIR, f"{name}.json")
+    with open(path, "w") as f:
+        json.dump(messages, f, indent=2)
+    return name
+
+def list_history():
+    if not os.path.exists(HISTORY_DIR): return []
+    files = [f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")]
+    return sorted(files, reverse=True)
+
+def compact_history(messages, model):
+    if len(messages) < 4: return messages
+    if HAVE_RICH: c.print("[dim]Compacting history...[/dim]")
+    else: print("Compacting history...")
+    prompt = "Summarize the key points of the conversation so far into a concise summary to be used as context for further chat. Keep all technical details, code requirements, and core objectives."
+    summary_messages = messages + [{"role": "user", "content": prompt}]
+    summary = chat_request_stream(model, summary_messages)
+    return [{"role": "system", "content": f"Previous conversation summary: {summary}"}]
+
+def run_shell():
+    print_banner()
+    messages = []
+    session_name = None
+    
+    if HAVE_PROMPT:
+        history = FileHistory(os.path.join(HOME, ".locai_history"))
+        kb = KeyBindings()
+        @kb.add(Keys.ControlM)
+        def _(event): event.current_buffer.validate_and_handle()
+        @kb.add(Keys.Escape, Keys.ControlM)
+        def _(event): event.current_buffer.insert_text('\n')
+        
+        session = PromptSession(
+            history=history, completer=LocaiCompleter(), 
+            auto_suggest=AutoSuggestFromHistory(), multiline=True, 
+            key_bindings=kb,
+            style=Style.from_dict({
+                'completion-menu.completion': 'bg:#1e1e1e #ffffff',
+                'completion-menu.completion.current': 'bg:#00aaaa #000000',
+                'scrollbar.background': 'bg:#333333',
+                'scrollbar.button': 'bg:#00aaaa',
+                'prompt': 'bold #00ff00',
+            })
+        )
+    
+    while True:
+        status = get_status()
+        active = status.get("active_model") or "none"
+        reqs = status.get("active_requests", 0)
+        
+        if HAVE_RICH: c.print(get_status_line(), style="dim")
+        else: print(f"Model: {active} | Requests: {reqs}")
+        
+        prompt = f"User > "
+        try:
+            user_input = session.prompt(prompt).strip() if HAVE_PROMPT else input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            if messages: save_history(messages, session_name)
+            if HAVE_RICH: c.print("\n[dim]Session saved. Goodbye.[/dim]")
+            else: print("\nSession saved. Goodbye.")
+            break
+        
+        if not user_input: continue
+        
+        if user_input.startswith("/"):
+            cmd_parts = user_input.split()
+            cmd = cmd_parts[0].lower()
+            rest = cmd_parts[1:]
+            
+            if cmd == "/exit":
+                if messages: save_history(messages, session_name)
+                break
+            elif cmd == "/vram": show_vram(); continue
+            elif cmd == "/clear":
+                messages = []
+                os.system('clear')
+                print_banner()
+                continue
+            elif cmd == "/models":
+                profiles = status.get("profiles", {})
+                if HAVE_RICH:
+                    table = Table(title="Available Models", box=None)
+                    table.add_column("ID", style="cyan"); table.add_column("Quant", style="magenta"); table.add_column("Context", style="green"); table.add_column("Status")
+                    for m in status.get("available_models", []):
+                        prof = profiles.get(m, {})
+                        quant = prof.get("cache_type_k", "q4_0") if "80B" in m or "32B" in m else "q8_0"  # Heuristic fallback if not in profile
+                        ctx = prof.get("ctx_size", "N/A")
+                        status_str = "[green]active[/green]" if m == active else "[dim]idle[/dim]"
+                        table.add_row(m, str(quant), str(ctx), status_str)
+                    c.print(table)
+                else:
+                    for m in status.get("available_models", []):
+                        print(f"{m} - {'active' if m == active else 'idle'}")
+                continue
+            elif cmd == "/status":
+                if HAVE_RICH: c.print(Panel(get_status_line(), title="System Status", expand=False))
+                else: print(f"Status: Model={active}, Requests={reqs}")
+                continue
+            elif cmd == "/compact":
+                if not active or active == "none":
+                    if HAVE_RICH: c.print("[yellow]No model loaded.[/yellow]")
+                    else: print("No model loaded.")
+                else:
+                    messages = compact_history(messages, active)
+                continue
+            elif cmd == "/undo":
+                if len(messages) >= 2:
+                    messages = messages[:-2]
+                    if HAVE_RICH: c.print("[dim]Last turn removed.[/dim]")
+                    else: print("Last turn removed.")
+                else:
+                    if HAVE_RICH: c.print("[yellow]Nothing to undo.[/yellow]")
+                    else: print("Nothing to undo.")
+                continue
+            elif cmd == "/retry":
+                if len(messages) >= 2:
+                    last_user = messages[-2]
+                    messages = messages[:-2]
+                    user_input = last_user["content"]
+                else:
+                    if HAVE_RICH: c.print("[yellow]Nothing to retry.[/yellow]")
+                    else: print("Nothing to retry.")
+                    continue
+            elif cmd == "/save":
+                name = rest[0] if rest else None
+                session_name = save_history(messages, name)
+                if HAVE_RICH: c.print(f"[dim]Saved as {session_name}[/dim]")
+                else: print(f"Saved as {session_name}")
+                continue
+            elif cmd == "/resume":
+                histories = list_history()
+                if not histories:
+                    if HAVE_RICH: c.print("[yellow]No saved sessions found.[/yellow]")
+                    else: print("No saved sessions found.")
+                    continue
+                if not rest:
+                    if HAVE_RICH:
+                        table = Table(title="Saved Sessions", box=None)
+                        table.add_column("Index", style="dim"); table.add_column("Name")
+                        for i, h in enumerate(histories): table.add_row(str(i), h.replace(".json", ""))
+                        c.print(table)
+                    else:
+                        for i, h in enumerate(histories): print(f"{i}: {h.replace('.json', '')}")
+                else:
+                    try:
+                        idx = int(rest[0])
+                        filename = histories[idx]
+                    except:
+                        filename = f"{rest[0]}.json"
+                    try:
+                        with open(os.path.join(HISTORY_DIR, filename), "r") as f:
+                            messages = json.load(f)
+                        session_name = filename.replace(".json", "")
+                        if HAVE_RICH: c.print(f"[green]Resumed session: {session_name}[/green]")
+                        else: print(f"Resumed session: {session_name}")
+                    except:
+                        if HAVE_RICH: c.print(f"[red]Could not find session: {rest[0]}[/red]")
+                        else: print(f"Could not find session: {rest[0]}")
+                continue
+            elif cmd == "/use":
+                if rest:
+                    model = rest[0]
+                    if ensure_model(model): pass
+                else:
+                    if HAVE_RICH: c.print("[yellow]Usage: /use <model_name>[/yellow]")
+                    else: print("Usage: /use <model_name>")
+                continue
+            elif cmd == "/help":
+                if HAVE_RICH:
+                    table = Table(title="Available Commands", box=None)
+                    table.add_column("Command", style="cyan"); table.add_column("Description")
+                    table.add_row("/use <model>", "Switch active model")
+                    table.add_row("/vram", "Show GPU memory usage")
+                    table.add_row("/models", "List available models")
+                    table.add_row("/clear", "Reset current context and clear screen")
+                    table.add_row("/compact", "Summarize conversation to save context")
+                    table.add_row("/undo", "Remove the last user/assistant turn")
+                    table.add_row("/retry", "Delete last response and try again")
+                    table.add_row("/save [name]", "Save the current session")
+                    table.add_row("/resume [name]", "List or load saved sessions")
+                    table.add_row("/status", "Show detailed system/GPU status")
+                    table.add_row("/exit", "Save and quit")
+                    c.print(table)
+                else:
+                    print("Commands: /use <model>, /vram, /models, /clear, /compact, /undo, /retry, /save, /resume, /status, /help, /exit")
+                continue
+            else:
+                if HAVE_RICH: c.print(f"[yellow]Unknown command: {cmd}. Type /help.[/yellow]")
+                else: print(f"Unknown command: {cmd}. Type /help.")
+                continue
+        
+        active_model = get_status().get("active_model")
+        if not active_model:
+            print("No model loaded. Use /use <model>")
+            continue
+            
+        messages.append({"role": "user", "content": user_input})
+        reply = chat_request_stream(active_model, messages)
+        if reply: messages.append({"role": "assistant", "content": reply})
+
+def main():
+    parser = argparse.ArgumentParser(prog="locai")
+    sub = parser.add_subparsers(dest="command")
+    
+    p_status = sub.add_parser("status"); p_status.set_defaults(func=lambda _: c.print(get_status_line()) if HAVE_RICH else print(get_status().get("active_model")))
+    p_chat = sub.add_parser("chat"); p_chat.add_argument("-m", "--model", required=True); p_chat.add_argument("prompt", nargs="*"); p_chat.set_defaults(func=lambda a: (ensure_model(a.model), chat_request_stream(a.model, [{"role": "user", "content": " ".join(a.prompt)}])))
+    
+    args = parser.parse_args()
+    if not args.command:
+        run_shell()
+    else:
+        try: args.func(args)
+        except Exception as e: 
+            if HAVE_RICH: c.print(f"[red]Error:[/red] {e}")
+            else: print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
